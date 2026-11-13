@@ -431,7 +431,7 @@ registry 或 GitHub API 不可达时，部署控制面报错但不影响已运�
 
 | 周次 | 主要工作 | 可演示产出 | 进入下一阶段的门禁 |
 | --- | --- | --- | --- |
-| 第1周 | 现状盘点、威胁模型、套餐与网络验证、双仓库与身份设计 | 资产清单、权限图、目标环境与阻碍表 | 审批能力可用或确定替代；无历史秘密继续使用；Agent 沙箱无生产访问 |
+| 第1周 | 现状盘点、威胁模型、套餐与网络验证、双仓库与身份设计；编写主机 bootstrap 脚本（Docker/Compose/Nginx 安装、环境检测、ghcr.io 连通性实测）与 GitHub 配置 setup 脚本（Environment/rulesets/CODEOWNERS 幂等配置） | 资产清单、权限图、目标环境与阻碍表；bootstrap 在干净 Ubuntu LTS 主机一条命令跑通 | 审批能力可用或确定替代；无历史秘密继续使用；Agent 沙箱无生产访问；bootstrap 环境检测输出具体失败原因 |
 | 第2周 | 应用配置、健康端点、优雅退出、镜像与本地栈 | 干净环境一键启动和业务 smoke | 无真实 .env 可运行；依赖超时和 SIGTERM 测试通过 |
 | 第3周 | PR CI、扫描、配置 lint、分支规则和 CODEOWNERS | 失败 PR 被拒绝、正常 PR 通过 | 必要检查不可由 Agent 关闭；main push 与控制文件修改负面测试通过 |
 | 第4周 | main 可信构建、隔离推送、digest 与 candidate | 一次构建产出可追溯镜像 | 产物与精确 source_sha、run、digest 绑定；CI 无生产秘密 |
@@ -525,7 +525,7 @@ Agent 接入可晚于容器化和 CI 基线完成，避免在控制面尚未保�
 2. CI 工程：PR 检查、main 构建、隔离推送、digest/candidate、依赖版本清单与供应链例外记录。
 3. 生产发布控制：双仓库规则、有效审批配置、manifest schema、可信来源校验、固定模板、deployer、timer、状态机和回滚入口。
 4. Agent 工程：无凭据沙箱、Proposal Broker、GitHub App 权限、动作与路径策略、审计与负面用例。
-5. 运维工程：主机初始化、TLS、备份恢复、监控告警、日志轮转、容量与清理策略、故障 runbook。
+5. 运维工程：主机初始化 bootstrap 脚本（幂等，含 Docker/Compose 安装、磁盘/端口/时间同步检测、registry 连通性探测与镜像复制兜底）、GitHub 配置 setup 脚本、TLS、备份恢复、监控告警、日志轮转、容量与清理策略、故障 runbook。学生无需 Docker/SSH/Linux 前置基础：服务器与 GitHub 配置由脚本和 Agent 完成，学生仅在审批节点确认；CI 报错由 Agent 经 ci.read 读取结果后自行修正重提。
 6. 证明材料：20 次正常发布、规定故障演练、权限测试矩阵、恢复演练、7 天运行观察及已知限制。
 
 最终演示应走完 Agent 修改业务代码、Broker 创建 PR、CI 通过、人工合并、指定 digest、独立批准、主机拉取、候选验证、切流、故障回退和审计查询。第二名成员只依赖文档在空白测试主机复现，才算完成交接。
