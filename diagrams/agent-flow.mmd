@@ -1,0 +1,47 @@
+flowchart LR
+  subgraph P1[① Agent 工程劳动]
+    direction TB
+    START([维护者发起任务])
+    ORC[起沙箱·领短时 token]
+    READ[repo.read 判断技术栈]
+    EDIT[写 Dockerfile 健康端点]
+    BUILD{sandbox.build}
+    FIX1[/失败：分析日志修代码/]
+    START --> ORC --> READ --> EDIT --> BUILD
+    FIX1 --> BUILD
+  end
+  subgraph P2[② 提案与 CI 自修]
+    direction TB
+    SUBMIT{proposal.submit 校验}
+    PR[agent/ 分支 + PR]
+    CI{Actions CI}
+    FIX2[/失败：Webhook 唤醒·修复重提/]
+    REJ[/被拒：调整 patch/]
+    SUBMIT -->|通过| PR --> CI
+    FIX2 --> CI
+    SUBMIT -->|拒绝| REJ
+  end
+  subgraph P3[③ 人工审批与发布（Agent 无通道）]
+    direction TB
+    DONE[全绿：沙箱销毁 token 作废]
+    REVIEW{维护者审查}
+    MANUAL[/要求修改：人工反馈/]
+    MERGE[批准合并 → digest 镜像]
+    RELEASE[Environment 人工审批]
+    DEPLOY[Deployer 蓝绿部署]
+    LIVE([上线 · Agent 零凭据])
+    DONE --> REVIEW
+    REVIEW -->|批准| MERGE --> RELEASE --> DEPLOY --> LIVE
+    REVIEW -->|要求修改| MANUAL
+  end
+  BUILD -->|失败| FIX1
+  BUILD -->|成功| SUBMIT
+  CI -->|失败| FIX2
+  CI -->|全绿| DONE
+
+  classDef success fill:#d9ead3,stroke:#38761d
+  classDef failure fill:#f4cccc,stroke:#cc0000
+  classDef human fill:#fff2cc,stroke:#bf9000
+  class BUILD,CI success
+  class FIX1,FIX2,REJ,MANUAL failure
+  class REVIEW,RELEASE human

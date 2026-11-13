@@ -1,0 +1,36 @@
+sequenceDiagram
+  autonumber
+  actor Human as 维护者/学生
+  participant ORC as Orchestrator
+  participant SB as KCI 沙箱<br/>(无凭据)
+  participant A as Agent<br/>(AgentEngine)
+  participant B as Proposal Broker
+  participant GH as GitHub
+  participant CI as Actions CI
+
+  Human->>ORC: 发起任务：容器化并上线
+  ORC->>B: 注册会话（沙箱实例证明）
+  B-->>ORC: session_token（短时·绑定实例）
+  ORC->>SB: 起一次性沙箱容器
+  ORC->>A: 启动 Agent（token + 任务 + Skills）
+
+  A->>B: repo.read → 读代码判断技术栈
+  B-->>A: 白名单路径内容
+  A->>SB: shell：写 Dockerfile + 健康端点
+  A->>B: sandbox.build → 独立构建执行器
+  B-->>A: 构建结果（成功/失败 + 日志摘要）
+  A->>B: proposal.submit(patch)
+  Note over B: 逐 hunk 路径校验/符号链接/<br/>控制文件拒绝 → 通过则建 agent/ 分支
+  B->>GH: 开 PR
+  GH->>CI: 触发 PR 检查
+  CI-->>GH: 失败（lint 错误）
+  GH--)B: Webhook
+  B--)A: 唤醒（pr/run/结论）
+  A->>B: ci.read → 筛选后日志
+  A->>SB: 修复代码
+  A->>B: proposal.submit（新 patch）
+  CI-->>GH: 全绿
+  A-->>ORC: 任务完成
+  ORC->>SB: 销毁容器，token 作废
+  Human->>GH: 审查 PR → 合并
+  Note over Human,GH: 发布需 ops 仓库发布请求 +<br/>Environment 人工审批（Agent 无通道）

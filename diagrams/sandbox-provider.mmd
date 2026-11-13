@@ -1,0 +1,52 @@
+classDiagram
+  direction LR
+  class SandboxProvider {
+    <<interface>>
+    Name
+    CreateInstance
+    Destroy
+  }
+  class Instance_ {
+    <<interface>>
+    ExecCmd
+    ReadFile
+    WriteFile
+    GetNetPolicy
+  }
+  class NetworkPolicy {
+    AllowEgress
+    DenyMeta
+    DNSStrategy
+  }
+  class Spec {
+    镜像模板ID
+    专用UID
+    workspace卷
+    资源上限
+    挂载白名单
+  }
+  class AgentKitProvider {
+    KCI沙箱
+    E2B_SDK
+    模板预热池
+    主线
+  }
+  class LocalProvider {
+    本地一次性容器
+    nftables白名单
+    rootless_BuildKit
+    基准备选
+  }
+  class ContractTests {
+    SEC07拒绝测试
+    网络DENY
+    销毁零残留
+    双轨同套
+  }
+
+  SandboxProvider <|.. AgentKitProvider : 主线
+  SandboxProvider <|.. LocalProvider : 备选
+  SandboxProvider ..> Spec : 创建参数
+  SandboxProvider ..> Instance_ : 返回
+  Instance_ ..> NetworkPolicy : 自报策略
+  ContractTests ..> SandboxProvider : 接口测试

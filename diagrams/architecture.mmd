@@ -1,0 +1,50 @@
+flowchart LR
+  subgraph AK[金山云星源 AgentKit 平台]
+    direction TB
+    AE[AgentEngine Serverless 运行时<br/>LangGraph / KSADK]
+    SK[Skills 中心<br/>containerize-node/spring/go<br/>fix-ci-failure / security-review]
+    KC[KCI 沙箱<br/>无凭据 · Provider 抽象层接入]
+    TR[Trace 可观测]
+  end
+
+  subgraph TB[受信边界（自研）]
+    direction TB
+    MCP[MCP Server devops-broker<br/>协议外壳 · 无秘密]
+    BR[Proposal Broker<br/>四动作白名单 + 策略管线<br/>哈希链审计 · GitHub App 身份]
+    NT[notifier<br/>Webhook 校验与事件分发]
+  end
+
+  subgraph GH[GitHub]
+    direction TB
+    APP[应用仓库<br/>PR 审查 → main 可信构建<br/>GHCR digest 绑定]
+    OPS[运维仓库<br/>发布请求 PR → release workflow<br/>Environment 人工审批]
+  end
+
+  subgraph PROD[生产主机]
+    direction TB
+    DEP[Deployer<br/>仅出站拉取 · manifest 全量校验]
+    BG[蓝绿双槽位 :18080/:18081]
+    CD[Caddy 切流/TLS/CORS 档位]
+    SEC[/宿主受信 secret/]
+    DB[(数据库)]
+  end
+
+  AE --> SK --> KC
+  AE <--> MCP
+  AE -. Trace .-> TR
+  MCP <--> BR
+  BR -->|agent/ 分支 + PR| APP
+  APP -->|Webhook CI 结果| NT
+  NT -->|唤醒自修| AE
+  OPS -->|获批 manifest| DEP --> BG --> CD
+  BG --> DB
+  SEC --> BG
+  DEP -->|告警| NT
+  NT -->|值守 Agent| AK
+
+  classDef platform fill:#e8f0fe,stroke:#4285f4
+  classDef trusted fill:#e6f4ea,stroke:#34a853
+  classDef prod fill:#fef7e0,stroke:#f9ab00
+  class AK,AE,SK,KC,TR platform
+  class TB,MCP,BR,NT trusted
+  class PROD,DEP,BG,CD,SEC,DB prod

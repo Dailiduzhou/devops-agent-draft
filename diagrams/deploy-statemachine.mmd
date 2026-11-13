@@ -1,0 +1,31 @@
+stateDiagram-v2
+  direction LR
+  state "Validated<br/>manifest 全量校验<br/>来源/generation/expiry/digest" as Validated
+  state "Prepared<br/>预检 · 按 digest 拉取" as Prepared
+  state "CandidateReady<br/>候选槽位启动<br/>健康 + 业务 smoke" as CandidateReady
+  state "Switched<br/>Caddy 切流<br/>validate→替换→reload" as Switched
+  state "Committed<br/>观察复验后原子提交" as Committed
+  state "Failed<br/>切流前失败：清理候选<br/>旧服务持续可用" as Failed
+  state "RollingBack" as RollingBack
+  state "RolledBack<br/>恢复旧配置并复验" as RolledBack
+  state "ManualRequired<br/>旧版本亦不健康<br/>保留诊断现场" as ManualRequired
+
+  [*] --> Validated
+  Validated --> Prepared
+  Prepared --> CandidateReady
+  CandidateReady --> Switched
+  Switched --> Committed
+  Committed --> [*]
+  Prepared --> Failed
+  CandidateReady --> Failed
+  Switched --> RollingBack: 切流后验证失败
+  RollingBack --> RolledBack
+  RollingBack --> ManualRequired
+  Failed --> [*]
+  RolledBack --> [*]
+  ManualRequired --> [*]
+
+  note right of Switched
+    journal：每步副作用前写意图
+    后写结果，崩溃后 reconciliation
+  end note
