@@ -4,42 +4,42 @@
 
 ## 一、Sandbox Provider 抽象层（plugin 架构）
 
-所有沙箱能力收敛为一个 Go interface，Broker / 构建调度器只依赖接口，不感知后端：
+所有沙箱能力收敛为一个抽象接口（生命周期、命令执行、文件交换、网络策略），Broker / 构建调度器只依赖接口，不感知后端，也不绑定具体实现语言：
 
-```go
-// internal/sandbox/provider.go
-type Provider interface {
-    Name() string                       // "agentkit" | "local"
+```
+SandboxProvider 接口（语言无关的契约描述）
 
-    // 生命周期
-    Create(ctx, Spec) (Instance, error) // 起一次性实例
-    // Spec: 镜像/模板ID、UID、workspace 卷、资源上限、超时、
+  Name() -> "agentkit" | "local"
+
+  /* 生命周期 */
+  Create(Spec) -> Instance
+    // Spec: 镜像/模板ID、专用 UID、workspace 卷、资源上限、超时、
     //       网络策略（见 NetworkPolicy）、挂载白名单
+  Destroy(Instance)
+    // 任务结束即销毁
 
-    Destroy(ctx, Instance) error        // 任务结束即销毁
-}
-
-type Instance interface {
-    Exec(ctx, Cmd) (ExecResult, error)  // 沙箱内执行命令（shell 工具后端）
+Instance 接口
+  Exec(Cmd) -> ExecResult
+    // 沙箱内执行命令（shell 工具后端）
     // ExecResult: 退出码 + stdout/stderr 截断 + 耗时
-    ReadFile / WriteFile(...)           // workspace 内文件交换（patch 生成用）
-    NetPolicy() NetworkPolicy           // 实际生效策略自报，供验收核对
-}
+  ReadFile / WriteFile(path, ...)
+    // workspace 内文件交换（patch 生成用）
+  NetPolicy() -> NetworkPolicy
+    // 实际生效策略自报，供验收核对
 
-type NetworkPolicy struct {
-    AllowEgress []string   // broker、构建执行器、受控包源
-    DenyMeta    bool       // 云元数据/loopback 代理/DNS 重绑定防护
-    DNSStrategy string     // "stub-resolver"
-}
+NetworkPolicy
+  AllowEgress: [broker、构建执行器、受控包源]
+  DenyMeta: 云元数据/loopback 代理/DNS 重绑定防护
+  DNSStrategy: "stub-resolver"
 ```
 
-两个实现均为独立 plugin 包，编译期选择（build tag 或 init 注册），不引入运行时动态加载：
+两个实现均为独立 plugin，按需选择接入方式，不引入运行时动态加载：
 
 ```
-internal/sandbox/
-  provider.go        # 接口 + Spec/NetworkPolicy 定义 + 注册表
-  local/             # Track-B：本地容器实现
-  agentkit/          # Track-A：KCI 沙箱实现
+sandbox/
+  provider           # 抽象接口 + Spec/NetworkPolicy 定义 + plugin 注册
+  local/             # Track-B：本地容器后端
+  agentkit/          # Track-A：KCI 沙箱后端
   contract/          # Provider 契约测试：任何后端必须通过的
                      # 能力与隔离测试（SEC07、网络 DENY、超时、销毁）
 ```
