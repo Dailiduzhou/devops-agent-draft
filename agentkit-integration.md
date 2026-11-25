@@ -1,100 +1,98 @@
-# 星源 AgentKit 接入方案（Track-A）
+# 星源 AgentKit 接入方案：拓扑 B
 
-基于金山云星源 AgentKit 官方文档（docs.ksyun.com，产品概述/快速入门/进阶入门/MCP/自定义 MCP/沙箱概述）的调研结论。本文是 Track-A 的总体方案；沙箱后端的 plugin 化与双轨对照见 `sandbox-tracks.md`。
+> 当前决策：AgentEngine 承载受信编排与固定工具适配，KCI 仅承载独立不可信执行工作区；BuildExecutor 单独选型。平台能力有文档依据，但本项目尚未完成真实账号/模板验证。完整边界见 [agent-runtime.md](agent-runtime.md)，执行底座见 [sandbox-tracks.md](sandbox-tracks.md)。
 
-## 一、平台能力速览（调研结论）
+## 一、组件映射与信任边界
 
-AgentKit = 开发套件（KSADK + AgentEngine CLI，兼容 LangGraph/LangChain/ADK/DeepAgents）+ Agent 开发运行平台（构建/部署/在线调试/Serverless 运行时）+ 能力组件（知识库、记忆库、MCP、沙箱 KCI、Skills 中心、AI 搜索）+ 可观测评测（Session/Trace/指标/评测）。
+| 本项目组件 | AgentKit 接入方式 | 安全约束 |
+| --- | --- | --- |
+| Agent 主循环、模型客户端 | KSADK + LangGraph / AgentEngine | 仅运行固定受信代码；模型输出不成为运行时本地代码 |
+| shell、源码工作区 | KCI SandboxProvider（E2B SDK） | 无模型/平台/GitHub/Broker/生产凭据；无生产网络 |
+| 镜像构建 | 独立 BuildExecutor | KCI 构建实例须实测；不满足则临时 VM，不开放宿主 socket |
+| Broker 四动作 | 自定义 MCP Server（Streamable HTTP） | 受信适配器附加身份，Broker 完整授权；不是通用 HTTP 代理 |
+| 流程知识 | 经审查的只读 Skills | 首版一个应用流程；可执行脚本只进入沙箱/构建环境 |
+| CI 事件 | notifier → 持久队列 → 运行时 API | 签名、去重、关联当前提交、串行执行和预算 |
+| 可观测 | Trace + 自建审计 | 认证材料不进 Trace；哈希链外部锚定用于篡改检测 |
 
-与我们架构的对应关系：
+平台参与受信执行基础设施，但不承载生产发布决定权。AgentKit 故障会影响模型任务、CI 自修与诊断；独立部署、已接受事务的本地恢复与人类告警必须不依赖 AgentKit。
 
-| 我们的组件 | AgentKit 对应物 |
-| --- | --- |
-| Orchestrator（调度脚本） | AgentEngine 运行时 + KSADK |
-| 沙箱容器 + 构建执行器 | KCI 沙箱（E2B SDK，自定义镜像模板、预热池、VPC 资源访问、实例提交为镜像） |
-| Proposal Broker 四动作 | 自定义 MCP Server（代码方式部署，Streamable HTTP；或 HTTP 转 MCP 包装） |
-| DevOps 任务知识（模板、修 CI 套路） | Skills 中心 |
-| 调用链观测 | AgentKit Trace（与我们哈希链审计并存，见第五节） |
+## 二、MCP：只暴露固定能力
 
-## 二、MCP 还是 Skills？——两者都用，分层接入
-
-### Broker 四动作 → MCP（能力层）
-
-MCP 的"Agent 调用外部受控服务"语义与 Broker 白名单动作代理一一对应：
-
-```
-MCP Server "devops-broker"（部署在受信网络）
-  ├── tool: repo.read(path, ref)        → Broker repo.read
-  ├── tool: proposal.submit(patch, ...) → Broker proposal.submit
-  ├── tool: ci.read(run_id)             → Broker ci.read
-  └── tool: sandbox.build(spec)         → Broker → KCI 沙箱执行
-```
-
-要点：
-
-- Broker 保持自研不变，只加 MCP 协议适配层（或用平台"HTTP 转 MCP"直接包装 Broker REST API）。
-- **鉴权不变**：MCP Server 校验我们的 session_token；AgentKit 平台 API-Key 只用于平台路由，不接触 GitHub App 私钥。适配层无状态、无秘密。
-- **安全边界不变**：Agent 经 MCP 拿到的仍只有过滤后结果；路径校验、限流、审计全在 Broker 内执行。MCP 只是协议外壳，不是新信任边界。
-
-### DevOps 流程 → Skills（流程层）
-
-| Skill | 内容 |
-| --- | --- |
-| containerize-node | 探测 express/nest → 选 Dockerfile 模板 → 加 livez/readyz → 调 sandbox.build 验证 |
-| containerize-spring | actuator 映射健康端点 → 多阶段分层 Dockerfile → 构建验证 |
-| containerize-go | Go 模板 + 静态编译检查 |
-| fix-ci-failure | ci.read 结果 → 按错误类别（lint/测试/构建）匹配修复策略 → 重提 patch |
-| security-review-app | 应用层检查：SQL 拼接、CORS 硬编码、明文密钥（呼应安全教育主线） |
-
-注意（官方文档明示的坑）：通用 Sandbox ≠ Skill 专用 Runtime；需用 KCI"实例提交为镜像"自建包含 Skill 运行时的专用模板。
-
-**一句话分工：MCP 给 Agent 手（能力），Skills 给 Agent 脑（流程）。** Agent 工具面仍是四动作白名单，Skills 只决定调用顺序与内容——与"工具面 = 能力面"的安全模型完全兼容。
-
-## 三、Webhook 通知链路（双向）
-
-### 方向 1：CI/CD → Agent（事件驱动替代轮询）
-
-```
-GitHub Actions（check_run completed / workflow_job 失败）
-  → GitHub Webhook → notifier（自建、受信侧，几十行 Go）
-     ├→ 签名校验 + 过滤（只推本会话关联的 PR/run）
-     ├→ 调 AgentEngine 运行时 API 唤醒挂起的 Agent 会话，
-     │   注入 {"pr": 42, "run": 123, "conclusion": "failure"}
-     └→ 回退：写任务队列，Agent 轮询 ci.read
+```text
+模型输出工具参数
+  → 受信工具适配器（固定工具注册表、会话映射、配额）
+  → MCP Server devops-broker
+       ├─ repo.read
+       ├─ proposal.submit
+       ├─ ci.read
+       └─ sandbox.build → 独立 BuildExecutor
+  → Proposal Broker（服务身份 + session + 动作授权 + 审计）
 ```
 
-CI 挂了 Agent 立即被唤醒修复，修完提交再等下一个 webhook——天然的事件循环演示。边界：webhook secret 只在 notifier；Agent 收到的是它本可用 ci.read 拿到的信息，webhook 未扩大 Agent 任何权限。
+模型不看到认证头、session_token、GitHub App 私钥或平台管理凭证。会话身份仅由受信代码附加，不能使用模型传入的 session_id 选择其他任务身份。沙箱不直接调用 MCP/Broker。
 
-### 方向 2：Deployer 警告 → 人 + Agent 值守
+MVP 优先直连自建 MCP/Broker 端点，以 mTLS 认证受信适配器并附加短期会话材料。若经平台 MCP 网关路由，必须 PoC 验证服务身份、会话隔离、认证材料保护和撤销链路；网关终止 TLS 后的受信转发也纳入可信计算基。不能把网关 API-Key 当作 app 仓库授权，也不能把 MCP 包装层描述为无需鉴权的透明外壳。
 
+Broker 的 repo、基线、PR、workspace/snapshot 归属与预算均为服务端授权状态；MCP schema 只做第一层输入约束，不能替代 Broker 策略。
+
+## 三、Skills：知识与执行分开
+
+首版选一个支持的应用（如 Node HTTP），提供容器化流程与一种 CI 错误修复流程；其余语言和安全审查 Skill 后置。
+
+- 只读流程 Skill 可以指导模型调用工具，但不能增加工具或改变权限。
+- 可执行 Skill 进入独立无秘密沙箱，通过固定执行入口运行；不得使用持有凭证的 AgentEngine `local_process` 执行不可信脚本。
+- 仓库提供的 Skill、脚本和配置按不可信代码处理，不能自动注册到运行时。
+- 通用 Sandbox 成功不代表专用 Skill Runtime 可用。云端 Skill Space、专用模板、账号权限和挂载必须独立验证；如比赛要求云端 Skills，先交付一个有真实调用证据的 Skill。
+- KCI 实例提交为镜像之前排除 workspace、令牌、日志与任务残留；预热模板不能保存任务身份。
+
+## 四、事件驱动的有界自修
+
+```text
+GitHub CI 完成事件
+  → notifier：验签、delivery_id 去重、持久入队、快速应答
+  → 核对 session / PR / head_sha / workflow / run
+  → 同一 session 串行消费；忽略旧提交失败、重复或已取消任务
+  → AgentEngine /v1/responses（session_id；挂起任务按需 ksadk_resume）
+  → ci.read → 沙箱修复 → 真实构建 → 更新受管 PR
 ```
-Deployer journal（发布失败/回滚/ManualRequired/探活异常）
-  → notifier → ① 人类渠道（飞书/钉钉 webhook + runbook 链接）
-             ② 唤醒值守 Agent：读 journal 摘要 + 公开日志 →
-               生成诊断初稿 → 提 docs/proposals 诊断报告 PR
-```
 
-边界：值守 Agent 只读摘要与公开日志，诊断走 PR；重试/回滚决策仍是 deployer 单调 generation + 人工入口的事。
+官方运行时文档描述了同 `session_id` 恢复历史和通用 interrupt 的 `ksadk_resume`；MCP approval 的恢复事件与 CI 通知不是同一语义，不能拿 CI 成功伪造人工批准。
 
-## 四、凭证管理（按官方凭证分层）
+配置持久会话存储、LangGraph checkpoint 和工具调用幂等；实测 Pod 重启、重复事件与中断恢复。不把“能恢复聊天记录”当作“能安全恢复有副作用任务”。
 
-| 凭证 | 存放 |
-| --- | --- |
-| IAM AK/SK（控制面、KS3） | 本地 .env 或控制台密文变量 |
-| AgentKit API-Key（MCP/沙箱/AI 搜索） | 控制台密文变量 |
-| 模型 API Key | 控制台密文变量 |
-| GitHub App 私钥 | 仅 Broker 侧（与平台无关） |
-| Agent session_token | 仅沙箱内，短时绑定实例 |
+首版只自动处理一种可重复注入的应用测试/构建错误。任务有最大轮数、时间、费用和构建次数；workflow 权限、发布审批、平台/网络故障输出人工待办。独立受保护测试阻止删除测试来取得假绿。
 
-原则：平台凭证绝不进入 Agent 会话上下文或沙箱环境。
+## 五、告警与平台故障
 
-## 五、收益、保留项与风险
+Deployer → 独立 notifier → 人类渠道（附 runbook）。人类通知不等待 AgentKit、模型或 Agent 队列。
 
-**收益**：沙箱/执行器/运行时托管三块自建基础设施换成平台能力，23 天 D 线工作量减半；Trace 满足可观测演示；Serverless 省自管 Agent 进程。
+值守 Agent 诊断 PR 后置；接入时只接收经授权、脱敏的运维摘要，不新增生产工具或运维仓库通道。平台故障时 Agent 分支降级/排队，独立告警出口仍可工作。
 
-**保留不变（安全叙事核心）**：Proposal Broker 及全部策略、哈希链审计、获批 manifest 发布协议、GitHub App 身份、人工审批。AgentKit 提供执行底座，不进入信任决策链。Trace 与哈希链并存：Trace 看调用链（平台侧），哈希链是不可篡改审计证据（我们自己的主张，不外包）。
+GitHub/registry 不可用可能阻止新部署，这是另一种外部依赖；本地回滚应基于已持久接受的授权和保留镜像，不要求平台或 GitHub 在线。
 
-**风险与实测项**：
-- KCI 网络隔离粒度（云元数据 DENY、DNS 重绑定）以 Provider 契约测试实测为准（sandbox-tracks.md）。
-- Skill Runtime 镜像需自建。
-- 平台可用性纳入故障分类：AgentKit 不可用只影响沙箱任务排队，生产链路完全不经过平台。
+## 六、凭证与配置
+
+| 凭证 | 使用处 | 约束 |
+| --- | --- | --- |
+| IAM AK/SK | 部署控制面/专用管理进程 | 按需使用，不默认灌入运行时和 guest |
+| AgentKit/Sandbox API-Key | 受信 Provider/调度适配器 | 只用于获准平台操作，不进入 shell |
+| 模型 API Key | 受信模型客户端 | 不进入 prompt、工具结果、Trace 或沙箱 |
+| MCP 调用身份、Broker session_token | 受信工具适配器 | 服务身份 + 短期会话共同校验，可撤销 |
+| GitHub App 私钥 | Broker | 不交给 AgentKit 或构建环境 |
+| 生产 secret | 对应生产受信主体/业务应用 | 不进入上述开发执行链 |
+
+控制台密文变量是存储保护，不是进程隔离；运行时使用时仍可能有明文。扫描分别覆盖不可信执行区与上下文/Trace，不能要求合法持凭证进程“内存零凭据”。
+
+## 七、早期门禁与后置项
+
+D1–3 验证模型 → MCP → Broker 薄链路、会话认证与撤销、KCI 工具沙箱隔离、BuildExecutor 真实构建、GitHub 审批可用性；D4–7 贯通一个应用的最小安全链路。生产副作用仅允许在已验证的授权与隔离边界内发生。
+
+第二后端、五枚 Skill、值守 Agent、任意框架支持和性能预热优化均不进入首版必达。平台接入能减少部分基础设施工作，但不能预设工作量减半或“只改一个环境变量即可完全脱离平台”。
+
+## 官方依据（实施时固定 SDK/模板版本并复核）
+
+- [快速入门](https://docs.ksyun.com/documents/45702)
+- [运行时接口说明](https://docs.ksyun.com/documents/45551)
+- [进阶入门：智能体开发](https://docs.ksyun.com/documents/45712)
+- [沙箱概述](https://docs.ksyun.com/documents/45552)
+- [创建沙箱模板](https://docs.ksyun.com/documents/45554?type=3)

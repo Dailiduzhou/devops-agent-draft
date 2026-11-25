@@ -1,136 +1,98 @@
-# 项目核心对齐文档（v2）
+# 项目核心对齐文档（v3：拓扑 B 与有界 MVP）
 
-供项目内部对齐使用。v2 修订：将**金山云星源 AgentKit 平台适配确立为主线**（Agent 运行时、沙箱、MCP、Skills 均基于平台能力构建），同时通过 **Sandbox Provider 抽象层**保留沙箱等执行组件的可替换性（自建后端随时可切换）。安全决策链（Broker、发布协议、审批、审计）不依赖任何平台。
+> 状态：架构决策已采纳，能力待实现/实测。本文为当前概要；运行时、执行底座与实施细节分别以 [agent-runtime.md](agent-runtime.md)、[sandbox-tracks.md](sandbox-tracks.md)、[implementation.md](implementation.md) 为准。`idea.md`、`original.md` 保留历史背景，不作为当前排期与拓扑依据。
 
-## 一、背景与要解决的问题
+## 一、定位与安全目标
 
-学生项目普遍缺少两块能力：
+同舟 Shipmate 帮助学生团队把一个明确支持的 Web 应用接入可审查、可重复构建、可审批发布、可回滚的工程流程。AI 执行代码改造、真实构建和限定范围的 CI 自修，人类负责代码审查、基础设施变更和发布决定。
 
-1. **安全意识**：对 SQL 注入、跨域、重放攻击、凭据管理等 Web 安全问题认识不足；引入 AI Agent 后，凭据和生产环境更是直接暴露在 Agent 可触达范围内。
-2. **部署与运维能力**：本地能跑、上线即崩；部署靠手工 SSH，没有版本化、审批、健康检查和回滚；对生产环境的安全法则（权限隔离、最小权限、审计）了解不深。
+**安全目标：未经批准的 Agent 会话不能直接读取生产秘密、访问生产网络或授权发布。** 获批业务代码可能使用应用合法持有的秘密和业务权限，仍需独立审查、最小权限与运行时控制；不宣称物理消除所有泄露。
 
-本项目要做的，就是**代替学生跑通从"一个学生 Web 项目"到"完整、安全、可持续运维的线上服务"的全流程**，并把这条流程本身做成可复用、可演示、可教学的产品——以金山云星源 AgentKit 作为 Agent 侧的运行底座。
+## 二、已确定的拓扑 B
 
-## 二、核心定位
+![总体架构](diagrams/architecture.png)
 
-- 输入：一个已有的学生 Web 项目（语言不限：Go / Node / Spring Boot…，流水线对应用语言零假设）。
-- 输出：一套端到端的工程系统——改造后的应用、基于 AgentKit 的 Agent 工程化链路、CI/CD 流水线、权限边界体系、故障恢复机制、以及完整的验证证据。
-- 差异化：不只是"跑通 DevOps"，而是让 AI Agent **托管在云平台 AgentKit 上**安全地参与真实工程——Agent 干活，但生产凭据、生产网络、发布决定权始终由受控边界和人来掌握。平台提供执行底座，不进入信任决策链。
+1. **受信运行时**：AgentEngine + KSADK/LangGraph 运行主循环、模型客户端和固定工具适配器。模型输出、源码、日志与 Skill 均为不可信输入，不能改变工具和身份。
+2. **不可信执行区**：SandboxProvider 提供独立 workspace、shell 与文件操作；BuildExecutor 消费不可变快照，在另一临时环境真实构建。不在持凭证的运行时或 Broker 执行仓库代码。
+3. **提案边界**：受信适配器经认证调用 MCP/Broker 四动作；Broker 独占 app 仓库的 GitHub App 身份、授权策略与审计。
+4. **发布边界**：应用 PR 人工审查、main 可信构建、ops 发布请求与独立 Environment 审批；生产 Deployer 仅出站消费获批 manifest，按 digest 部署。
 
-## 三、核心目标
+### 凭证与认证
 
-1. **可复现交付**：新成员凭 README 在干净机器上一键本地启动与测试。
-2. **一次构建，处处部署**：同一镜像 digest 贯穿验证与生产发布，生产主机只消费不可变镜像。
-3. **全程可审计**：每次生产变更有来源提交、检查结果、人工审批记录、获批 manifest 和实际部署结果；Agent 侧有 AgentKit Trace + 自建哈希链审计双通道。
-4. **故障自愈**：健康验证失败自动恢复旧应用，保留故障现场；数据库变更独立管理。
-5. **生产级运维**：TLS、优雅退出、资源约束、日志轮转、监控告警、备份与恢复演练。
+模型/平台凭证仅给对应受信运行时/调度器，Broker 会话材料仅给固定适配器，App 私钥仅在 Broker，生产凭据仅给对应生产主体。模型上下文、工具结果和不可信沙箱/构建环境不包含这些凭据。
 
-## 四、服务对象
+MVP 以 mTLS 服务身份 + 短期会话材料认证适配器，Broker 服务端维护仓库/基线/PR/workspace/snapshot/预算归属。沙箱不直连 Broker、模型或平台管理 API；自报 instance_id 不算实例身份认证。平台 MCP 网关若参与鉴权，须先验证可靠认证转发/终止和会话隔离。
 
-- **直接对象**：学生工程团队（23 天黑客松节奏，详见 implementation.md）。
-- **最终受益者**：所有想把课程/比赛项目安全上线的开发者——他们获得的是一条现成的安全部署路径和一套可以照做的安全工程范式。
-- **角色分工**：项目负责人（架构与门禁）、应用与容器负责人（应用契约与镜像）、平台与发布负责人（CI/ops/deployer）、Agent 与安全评审负责人（AgentKit 接入、Broker 策略、负面用例与凭据审计）。
+密文变量不等于运行时内存无明文。受信代码与平台基础设施属于可信计算基；不能承诺运行时被攻陷仍无任何风险。
 
-## 五、主线架构：基于 AgentKit 的 Agent-in-the-Loop
+## 三、核心流程
 
-### 5.1 组件映射
-
-| 能力 | 承载组件 | 说明 |
-| --- | --- | --- |
-| Agent 主循环与运行时 | KSADK（LangGraph）+ AgentEngine Serverless 运行时 | 兼容主流框架，云端托管，在线调试 |
-| Agent 沙箱与构建执行 | KCI 沙箱（E2B SDK，自定义模板、预热池） | 隔离执行代码/命令/构建，经 Provider 抽象层接入（见 §6） |
-| Broker 四动作对外暴露 | 自定义 MCP Server（Streamable HTTP） | repo.read / proposal.submit / ci.read / sandbox.build 四个 MCP tool，协议外壳，无新信任边界 |
-| DevOps 流程知识 | Skills 中心 | containerize-node/spring/go、fix-ci-failure、security-review-app |
-| CI/部署事件驱动 | GitHub Webhook + notifier → AgentEngine 运行时 API 唤醒 | CI 失败即刻唤醒 Agent 修复；Deployer 告警触发值守 Agent 出诊断 PR |
-| 可观测 | AgentKit Trace + 自建哈希链审计 | Trace 看调用链；哈希链是不可篡改证据，不外包 |
-
-**分层原则：MCP 给 Agent 手（能力，四动作白名单），Skills 给 Agent 脑（流程）。** Agent 工具面仍是四动作白名单，Skills 只决定调用顺序——"工具面 = 能力面"的安全模型不变。
-
-### 5.2 核心链路
-
-```
-AgentEngine 运行时（AgentKit 托管）
-    │ 加载 Skills（容器化/修CI/安全审查）
-    ▼
-KCI 沙箱（无凭据，经 Provider 抽象层）
-    │ broker_call（MCP）
-    ▼
-Proposal Broker（自研，持有 GitHub App 身份，四动作白名单 + 策略 + 哈希链审计）
-    ▼
-应用仓库 PR → 人工审查 → 合并 main → 可信构建 → 镜像推送（digest 绑定 source_sha）
-    ▼                          ▲
-    │ Webhook（CI 失败）→ notifier 唤醒 Agent 自修（事件驱动闭环）
-    ▼
-运维仓库（Agent 无权访问）：发布请求 PR → release workflow 校验候选来源
-    ▼
-production Environment 人工审批 → 生成获批 manifest（GitHub Release 资产）
-    ▼
-生产主机 deployer（systemd timer，仅出站拉取）：校验 manifest → 蓝绿双槽位
-    → 候选验证 → Caddy 切流 → 观察窗口 → 原子提交；失败自动回滚
-    → 告警经 notifier → 人类渠道 + 值守 Agent 诊断 PR
+```text
+维护者授权任务 → 调度器登记会话/创建独立沙箱
+→ 运行时调用 repo.read → Provider 写入源码
+→ shell 在沙箱改代码 → 冻结并登记不可变快照
+→ sandbox.build → 独立 BuildExecutor 构建与 smoke
+→ proposal.submit → 受管分支/PR
+→ CI 事件：notifier 验签/去重/排队/关联当前 head
+→ 同 session 在预算内读 ci.read、修复并更新 PR
+→ 撤销身份、回收构建与沙箱
+→ 维护者审查合并 → main 可信构建/隔离推送 → digest/candidate
+→ ops 请求与独立审批 → manifest → Deployer 蓝绿部署/恢复
 ```
 
-三条关键设计原则：
+不是所有 CI 错误都可自动修复：workflow 权限、平台故障、安全策略拒绝和超出预算的任务输出人工待办；不得修改受保护测试或放开权限取得假绿。
 
-1. **提案与发布双边界**：Agent 的产出只以 PR 进入；生产发布需要独立仓库、独立身份、独立人工审批。
-2. **Pull 部署**：服务器只出站拉取获批 manifest 和不可变镜像，授权来自受保护 workflow 生成的批准记录——**生产链路完全不经过 AgentKit**。
-3. **部署状态机**：预检 → 拉取 → 候选启动 → 验证 → 切流 → 观察 → 原子提交，每步有 journal、幂等和补偿路径。
+## 四、执行底座可替换，但构建与沙箱独立
 
-## 六、可扩展性：Sandbox Provider 抽象层
-
-沙箱不是写死绑定 KCI。所有沙箱能力收敛为一个抽象接口（Provider / Instance / NetworkPolicy），后端以 plugin 形式接入，可替换：
-
-| 后端 | 实现 | 适用 |
+| 能力 | 当前选择 | 回退与限制 |
 | --- | --- | --- |
-| `agentkit`（主线） | KCI 沙箱，E2B SDK，模板预热加速 | 黑客松主线：省自建基础设施，弹性并发 |
-| `local`（备选） | 本地一次性容器 + 专用 UID + nftables 白名单 + rootless BuildKit | 零云平台依赖部署；隔离粒度完全自控的基准实现 |
+| Agent 编排 | AgentEngine 主线 | 本地受信运行时是未来适配，不随沙箱开关自动实现 |
+| 工具沙箱 | 优先验证 KCI | 不达标才评估 local；首版只交付一个合格组合 |
+| BuildExecutor | 独立临时构建环境 | KCI 构建不满足条件则使用专用节点临时 VM |
+| 网络 | 默认拒绝、受信控制端交换源码 | 依赖优先预置；需要下载则受控阶段，不自动开放外网 |
+| 验证 | 共享黑盒行为测试 + 后端专属证据 | 有限测试不证明 VM/容器等强度或物理零残留 |
 
-**契约测试套件与后端无关**：SEC07（宿主文件/元数据/Docker socket 访问拒绝）、网络 DENY、资源上限、销毁零残留等用例直接针对 Provider 接口编写，两个后端跑同一套。KCI 隔离粒度是否达标由契约测试实测裁决，而非假设。切换后端 = 换一个环境变量，上层（Broker、发布协议、deployer）零改动。
+构建节点与生产主机分离。rootless 不能代替 user namespace、PID/挂载、网络、资源和回收验证。snapshot 一致性、跨任务缓存隔离与孤儿清理属于首版要求。
 
-## 七、学生能力差距与我们的答案
+后端预置且满足契约后可配置切换；这不自动替换模型、GitHub/GHCR、MCP/Skills 和会话存储，也不意味着完整离线部署。
 
-学生的起点是"可能没有 Docker、SSH、Linux 基础，看不懂 workflow 报错，不懂 Repo Environment、known_hosts、镜像仓库配置"。答案不是补课，而是**把每一个能力缺口变成项目的一个交付物**：
+## 五、发布与恢复原则
 
-| 学生缺的能力 | 我们的交付 | 学生实际要做的 |
-| --- | --- | --- |
-| 装 Docker / Compose / Caddy | ops 仓库 bootstrap 幂等初始化脚本（含环境检测，报具体失败原因） | 干净 Ubuntu LTS 主机执行一条命令 |
-| 配置 GitHub Environment / rulesets / CODEOWNERS | 幂等 setup 脚本（gh CLI / API） | 复制粘贴一条命令并确认输出 |
-| 服务器 SSH、known_hosts、密钥 | 全程 Pull 部署，发布流程零 SSH 依赖 | 无 |
-| 镜像仓库配置 | GHCR 推送用 GITHUB_TOKEN；主机 bootstrap 实测连通性，不足时镜像复制兜底 | 无 |
-| 看不懂 CI/workflow 报错 | CI Webhook 唤醒 AgentKit 上的 Agent，经 ci.read 读筛选日志自行修正重提 | 看 Agent 汇报的结论 |
-| 安全配置判断 | 分支保护、审批门禁、扫描全部由 setup 脚本和模板预置 | 审批界面核对 diff 并点批准 |
+- Broker 不提供 merge/审批工具，Agent 无 GitHub 身份；App 的实际 main 更新能力另由规则与 API 负例验证，不仅看 token 权限名称。
+- 发布绑定精确 source_sha、候选 run、image digest、不可变 ops commit、approval run/attempt 与受信 workflow/脚本版本。Environment 要在真实账号验证，不能只写 YAML。
+- manifest 有严格 Schema、内容绑定、有效期与单调序号；Release 资产不是天然签名对象。首次接受前篡改、跳过审批 job、旧序号与同 ID 异 hash 均需拒绝。
+- Deployer：Validated → Prepared → CandidateReady → Switched → Committed；切流前失败清候选，切流后分类回滚，旧版本也失败进入 ManualRequired。
+- journal 每步写意图/结果；原子文件更新之外还需代理运行态、容器身份与真实入口检查。旧镜像保留，已接受事务的本地恢复不依赖云平台在线。
+- 应用回滚不撤销数据与外部副作用，不解决单机故障高可用；数据库兼容和备份恢复单独验收。
 
-**分工原则**：Agent（AgentKit 托管）执行全部代码改造、构建验证和报错诊断；学生保留人工审批——这既是教学价值所在，也是架构中不可绕过的人工门禁。学生能力要求从"会操作"降为"能看懂提示并做出批准决定"。
+## 六、MVP 与后置能力
 
-## 八、能力地图（我们交付什么）
-
-| 板块 | 内容 |
+| 首版必须交付 | 后续扩展 |
 | --- | --- |
-| Agent 平台接入 | AgentEngine 运行时部署、KCI 沙箱模板（含 Skill Runtime 镜像）、devops-broker MCP Server、五枚 Skills、Webhook 事件驱动闭环 |
-| 沙箱抽象层 | Sandbox Provider interface + agentkit/local 双后端 + 后端无关契约测试 |
-| 应用改造 | 语言无关契约（livez/readyz/version、优雅退出、超时）、Go/Node/Spring Boot 三份模板、业务 smoke、多阶段非 root 镜像 |
-| 本地闭环 | compose 开发栈、make dev-up/smoke/dev-down、示例配置 |
-| CI | 按信任等级拆分 job：PR checks → main 可信构建 → 隔离镜像推送 → candidate 元数据（SBOM、digest、来源绑定） |
-| 发布协议 | ops 仓库发布请求、Environment 审批、严格 JSON Schema 的 manifest、generation 单调序号、有效期 |
-| 一键初始化 | 主机 bootstrap（Docker/Compose/Caddy/证书/目录/registry 连通性）、GitHub setup 脚本、部署档位配置（tls_mode/cors_mode/access，宿主受信配置，Agent 改不了） |
-| 生产部署 | Go deployer、flock、崩溃恢复 journal、蓝绿双槽位、Caddy 模板渲染切流 |
-| Agent 安全 | 无凭据沙箱、Broker 四动作白名单 + 策略管线、哈希链审计 |
-| 秘密管理 | 宿主受限目录只读 secret、AgentKit 凭证分层（平台凭证绝不进 Agent 会话上下文）、轮换与吊销 |
-| 数据安全 | expand-contract 迁移、迁移锁、每日备份 + 异地副本 + 空白实例恢复演练 |
-| 运维值守 | 外部探活、结构化日志、告警 runbook、故障分类；notifier 双出口（人 + 值守 Agent） |
-| 验证体系 | 20+ 自动化安全与故障用例，含 Provider 契约测试与 AgentKit 平台故障分类 |
+| 一个明确支持的无本地持久状态 HTTP 应用 | 更多语言模板、陌生项目泛化改造 |
+| 一个通过门禁的 SandboxProvider + BuildExecutor 组合 | 第二后端、更多隔离机制与性能优化 |
+| 一个容器化流程和一种 CI 错误自修 | 五枚云端 Skills、值守 Agent |
+| Broker 四动作、独立审批、digest 发布 | UI、更复杂调度与供应链证明 |
+| 双槽位、关键崩溃恢复、独立人类告警 | 复杂迁移、多架构、完整离线系统 |
+| 持久数据场景的兼容与恢复演练 | 更多数据系统与长期 SLA 观察 |
 
-## 九、排期与验收（要点）
+bootstrap/setup 由有权限的维护者执行，预检 Docker/Compose/Caddy、网络、时间、磁盘及 GitHub 门禁；不会消除管理员授权、账号开通、证书信任与审查判断的责任。CORS/TLS 档位受宿主控制，但不保证任意应用零改动。
 
-排期按 23 天黑客松节奏（四线并行，详见 implementation.md），主线变化：Agent/沙箱线基于 AgentKit 组件搭建（D3–5 local Provider + 契约测试冻结，D9–15 agentkit Provider + MCP + Skills，D16–18 Webhook 事件闭环与 Agent 全链路接入）。
+## 七、排期与验收
 
-验收在原口径上增加：
+23 天四人实施预算，详见 implementation：D1–3 平台薄链路、认证、真实构建/隔离和审批 PoC；D4–7 单应用最小闭环；D8–15 自修、回滚/崩溃、资源和事件加固；D16–20 负例、故障与证据；D21–23 彩排/缓冲。不把 Agent 首次接入推迟到 D16。
 
-- **双后端契约测试**：agentkit 与 local 跑同一套隔离/能力用例，全部通过。
-- **事件驱动闭环**：CI 注入失败 → Webhook 唤醒 Agent → 自动修复重提 → CI 转绿，全程无人工干预，Trace 可回放。
-- **平台解耦证明**：模拟 AgentKit 不可用，生产部署链路（审批 → manifest → deployer → 回滚）不受影响。
-- 原有口径保留：发布成功率 ≥19/20、故障演练全恢复、回退 ≤120s、权限越界用例 100% 拒绝、幂等、RPO≤24h/RTO≤60min、凭据零暴露。
+验收目标而非现有成绩：
 
-## 十、一句话
+- 固定 20 次发布至少 19 次成功；定义故障演练有正确结果；回退≤120s（检测失败到旧业务恢复，另计检测延迟）。
+- 权限/发布必测负例全部拒绝，重复 manifest 无新增部署副作用，真实身份/网络/文件结果留证。
+- 上下文、沙箱/构建区、Trace/日志、镜像层规定凭据样本扫描零命中，不对合法持凭证进程做“零秘密”承诺。
+- 一个合格后端组合通过契约门禁，重复/过期事件无重复副作用，明确故障在预算内自修。
+- AgentKit 中断不阻塞独立发布、本地恢复、人类告警；模型任务与诊断允许降级。
+- 如含持久数据，空白实例实测 RPO≤24h/RTO≤60min；不含则标注不适用。
 
-我们交付一条**可审计、可回滚、Agent 权限被结构性约束**的端到端部署流水线：学生项目进来，安全稳定的线上服务出去——Agent 跑在金山云星源 AgentKit 上干活，执行底座可插拔，信任决策链永远在我们自己的边界里，并且每一步都有证据。
+Trace 用于调用链，审计哈希链和外部锚定用于篡改检测；均不记录模型内部全部思考，也不提供绝对不可篡改保证。
+
+## 八、一句话
+
+**AI 做工程劳动，人掌握审查与发布权；凭证留在对应受信主体，代码执行进入隔离环境，安全与恢复声明由明确范围内的证据支持。**

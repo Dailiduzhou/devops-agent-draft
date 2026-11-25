@@ -1,57 +1,96 @@
-# Agent 运行时：启动、能力、限制与权限分工
+# Agent 运行时：拓扑 B、身份与能力边界
 
-## 一、Agent 的启动与生命周期
+> 当前决策：采用拓扑 B。本文定义运行位置、凭证归属与工具执行边界；实现范围和排期见 [implementation.md](implementation.md)。以下为设计与验收要求，不代表已经实现或测试通过。
 
-Agent = 跑在无凭据沙箱容器里的 LLM 会话，任务驱动、短生命周期。
+## 一、拓扑 B：主循环与不可信执行环境分离
 
-1. 人类操作员向 orchestrator（受信调度脚本）发起任务。
-2. orchestrator 创建一次性沙箱容器：专用 UID、独立 /workspace；不挂载宿主 HOME/.ssh/Docker socket/SSH_AUTH_SOCK；环境变量白名单；网络默认 deny，仅放行 Broker 与构建执行器及受控包源。
-3. orchestrator 向 Broker 注册会话，Broker 校验沙箱实例登记，签发短时 session_token（绑定容器 ID，TTL=任务时长）。
-4. Agent 进程持有且仅持有 session_token + 任务描述 + 工具清单。
-5. 任务完成或 TTL 到期 → 容器销毁，token 自动作废。每次任务全新身份，零残留。
+```text
+维护者 → 受信调度器 / AgentEngine 运行时（KSADK + LangGraph）
+                        ├─ 模型客户端：使用模型凭证
+                        ├─ 固定工具适配器：校验参数、附加服务身份
+                        │    ├─ broker_call → MCP → Proposal Broker
+                        │    └─ shell → SandboxProvider → 独立执行沙箱
+                        └─ 会话状态 / 预算 / 工具调用记录
 
-Agent 的身份就是 session_token；Broker 每请求校验 token 与容器实例匹配，防复用。orchestrator 只决定"开不开沙箱"，不参与代码与发布决策。
+Proposal Broker ── sandbox.build ──> BuildExecutor 控制端
+                                      └─ 独立临时构建环境
+Proposal Broker ── GitHub App ──> 应用仓库提案 PR
 
-## 二、工具面 = 能力面
+人工审查与独立发布审批 → 获批 manifest → 生产 Deployer
+```
 
-### shell（沙箱本地）
-沙箱内 exec，UID 2000，只写 /workspace。读代码、编译、测试、生成 patch。构建经 sandbox.build 代理。
+区分四个主体：模型产生不可信文本和工具参数；受信运行时维护状态、调用模型；固定工具适配器执行受控分派；沙箱执行 shell、仓库代码和可执行 Skill。**持有平台凭证的运行时不得执行模型生成或仓库提供的任意代码。**
 
-### broker_call（唯一出沙箱通道）
-| 动作 | 用途 | 典型链路 |
+受信运行时仅运行经审查、固定版本的编排与适配代码；禁用本地任意 shell/Python、`eval/exec`、仓库插件动态加载和不可信 `local_process` Skill。模型、源码、日志和 Skill 输出一律按不可信输入处理，不能改写工具注册表、身份、目标仓库或安全策略。
+
+## 二、安全目标与不保证的事项
+
+目标：未经批准的 Agent 会话不能直接读取生产秘密、访问生产网络或授权发布。模型只能请求有限工具能力；权限由适配器、Broker、OS、挂载、网络及 GitHub 门禁共同约束，不以提示词或工具名称作为边界。
+
+限制：Agent 生成的代码若获批上线，可能使用应用合法持有的数据库/API 权限。人工审批是授权而非代码安全证明；只读 secret 挂载也不阻止应用读取和泄露。通过独立审查、受保护验收测试、最小业务账号、生产出站控制和凭据轮换降低风险，不宣称物理消除所有凭据泄露。
+
+可信计算基包括受信运行时及适配器、调度器、Broker、BuildExecutor 控制端、平台与隔离基础设施、GitHub/管理员/审批人、发布 workflow 和 Deployer。上述主体被攻陷不属于“提示注入无法越权”的无条件保证。
+
+## 三、凭证归属与会话认证
+
+| 凭证/身份 | 使用主体 | 不可信执行区是否可读 |
 | --- | --- | --- |
-| repo.read | 了解项目：文件树/源码/依赖，白名单路径 | 任务开始 → 判断技术栈 |
-| proposal.submit | 交付：patch → Broker 建 agent/ 分支 + PR | 改完+构建通过 → 提交 |
-| ci.read | 迭代：读筛选后 CI 日志 → 修 → 再提 | PR run_id → 分析失败 → 修复循环 |
-| sandbox.build | 真实构建验证 | 提 PR 前完整 build + smoke |
+| 模型 API Key | 受信运行时模型客户端 | 否 |
+| AgentKit 沙箱管理/API 凭证 | 受信调度器或 Provider 适配器 | 否 |
+| IAM AK/SK（部署控制面） | 部署工具或专用控制进程；不无差别注入运行时 | 否 |
+| Broker 调用方身份与短期 session_token | 受信工具适配器 | 否 |
+| GitHub App 私钥/installation token | Broker | 否 |
+| 构建基础设施管理身份 | BuildExecutor 控制端 | 否 |
+| 生产业务 secret | 对应生产应用，按需授予 | 不进入 Agent 沙箱或构建环境 |
+| 发布、镜像拉取、迁移、备份身份 | 对应生产受信主体，彼此分离 | 否 |
 
-不存在的工具：git push、任意 HTTP、SSH、沙箱外写、secret 读取、workflow 创建、merge、审批评论。
+密文变量解决存储问题，使用凭证的受信进程仍可能接触明文。准确承诺是“模型上下文不包含认证材料，不可信沙箱/构建环境不持有模型、平台、GitHub、Broker 或生产凭据”，而不是“运行时进程零凭据”。Trace、日志和工具结果不记录认证头、完整环境或密钥。
 
-## 三、限制四层次（纵深防御）
+MVP 由受信适配器发起所有 Broker 请求，沙箱不直连 Broker、模型或平台管理 API。适配器经 TLS 和独立服务身份（MVP 采用 mTLS）认证；Broker 的会话记录关联调用方、维护者授权的 app 仓库、基线、PR、workspace/沙箱、预算及有效期。session_token 留在适配器，必须与服务身份一起校验；模型参数不能选择或替换调用方身份。
 
-1. **网络层**：仅 Broker、构建执行器、受控包管理源可达；deny 云元数据/宿主内网/loopback 代理；DNS 由本地 stub resolver 固定。Agent 被完全攻破也发不出 GitHub/生产/任意外网包。
-2. **身份层**：零凭据——沙箱内不存在任何 GitHub token、SSH 密钥、云凭据；session_token 对 GitHub 无意义。物理上排除"Agent 泄露凭据"。
-3. **Broker 策略层**：统一管线——认证（token+容器匹配）→ 限流 → 严格 Schema → 动作策略 → 以 App token 执行（token 永不回传）→ 结果过滤 → 哈希链审计。
-   - repo.read：repo/ref 白名单，路径规范化 + 允许树检查，控制路径拒绝，响应截断。
-   - proposal.submit：逐 hunk 路径检查（拒绝 ../、绝对路径、.git/）；符号链接逃逸检查；控制文件（.github/workflows、CODEOWNERS、策略文件、requests/、.gitleaksignore）只能以 docs/proposals 文本建议；base_sha 必须为 main HEAD；Git 大小写/同形字符专项测试；分支名与 PR 由 Broker 生成。
-   - sandbox.build：转发独立无秘密构建执行器（rootless BuildKit/临时容器），固定参数、超时、资源限制，只返回结论+日志摘要。允许改 Dockerfile = 允许写任意构建代码，故用无秘密可丢弃环境兜底。
-   - ci.read：run_id 必须关联本会话 PR；白名单正则提取失败步骤/编译错误/测试名/结论，不回原始日志。
-4. **平台层**：App 安装范围仅 app 仓库、contents:write+pull_requests:write；main 强制 PR+独立批准+状态检查，无 bypass；运维仓库未安装 App——生产授权通道物理不存在。
+沙箱 ID 只作为资源归属关联，不能单凭请求自报 ID 或 token 中的 instance_id 证明请求来源。mTLS 校验服务身份，不证明任意 guest 的完整性；受信适配器被攻陷仍可能滥用自身权限。共享 MCP 网关必须能安全传递或终止并重建受信认证链，且隔离会话；早期 PoC 验证，不允许静默降级成匿名 Broker。
 
-## 四、权限分工
+## 四、启动、事件与销毁
 
-**Agent 有劳动能力，Broker 有代理能力，人类有决定能力。**
+1. 维护者向受信调度器提交任务；调度器固定 app 仓库、基线和预算。
+2. 调度器通过 SandboxProvider 创建一次性 workspace；无宿主 HOME/.ssh、Docker socket、SSH_AUTH_SOCK、平台环境变量和生产网络。
+3. 调度器经管理入口在 Broker 登记会话与资源；该入口不暴露给模型。短期会话认证材料只交给工具适配器。
+4. 运行时加载经审查的只读流程 Skill。`repo.read` 返回受限源码后，经 Provider 文件接口写入 workspace；shell 仅在该沙箱执行。
+5. 构建前由受信协调端冻结/导出一致的 workspace 快照，校验路径、文件类型和大小，登记内容摘要与归属。适配器附加服务端认可的 snapshot_id；模型不能提交宿主路径、任意 URL 或其他会话的快照。
+6. Broker 调度独立 BuildExecutor。沙箱构建仅供反馈，生产镜像由受保护 main CI 重新构建。
+7. CI Webhook 经 notifier 验签、持久化、去重，关联当前 PR head/run；按会话串行触发同一 session 的继续执行。恢复依赖持久会话与 graph checkpoint，不仅是历史文本。
+8. 完成、取消、超时或预算耗尽：撤销会话授权，取消并回收构建任务，销毁沙箱/workspace，记录结果。进程重启后回收孤儿资源。人工要求修改时开启新授权会话并重新核对已有 PR 归属，不复活旧 token。
 
-| 能力 | Agent | Broker | 人类维护者 |
-| --- | --- | --- | --- |
-| 读应用源码 | repo.read（白名单） | App 代执行 | 直接 |
-| 代码提案 | patch → proposal.submit | 校验+写分支+开 PR | 审查合并 |
-| 读 CI 结果 | ci.read（过滤版） | 持映射+过滤原始日志 | 直接 |
-| 触发构建 | 请求 sandbox.build | 调度隔离执行器 | 直接 |
-| 合并/发布触发 | 无通道 | 无权限 | ops 发布请求 PR |
-| 批准生产 | 无通道 | 无权限 | Environment 审批（唯一入口） |
-| 生产凭据 | 不存在 | 不存在 | 宿主 secret / Env secrets |
+任务预算必须包含修复轮数、墙钟时间、模型费用、构建次数、资源与日志大小；到限后输出诊断和人工待办。CI 等待期间可续期/重建沙箱，但不能由模型自助延长授权。
 
-## 五、完整任务时序示例
+## 五、工具面与 Broker 策略
 
-Node 项目容器化：repo.read 判断技术栈 → shell 写 Dockerfile+健康端点 → sandbox.build 失败（npm 超时）→ 修复 → 构建成功 → proposal.submit → PR #42 → ci.read 发现 lint 失败 → 修正重提 → 全绿 → 沙箱销毁 → 维护者审查合并 → 发布协议（Agent 不再参与）。全程 broker_call 入哈希链审计；提示注入试图读宿主文件外传时，shell 只见沙箱文件、网络层 DENY 无路可走（SEC05/SEC07 实测）。
+### shell
+
+固定适配器通过 Provider 在独立沙箱执行命令，只能写获准 workspace/临时目录。测试脚本、编译器插件、依赖安装脚本均视为任意代码；安全依赖隔离而非命令名称。工具适配器本身不在 AgentEngine 本地执行这些命令。
+
+### broker_call：四动作不变
+
+| 动作 | 输入及策略 | 输出 |
+| --- | --- | --- |
+| repo.read | 服务端固定 repo/ref；相对路径允许树、规范化、大小限制 | 受限源码/文件树 |
+| proposal.submit | base_sha、预期受管 PR head、文本 patch；校验 Git tree/模式/父路径/最终 diff | Broker 生成分支、提交与 PR；重试更新已有受管 PR |
+| ci.read | run 必须关联当前会话提案、允许 workflow 和提交 | 筛选、截断、脱敏的结构化失败信息 |
+| sandbox.build | 固定 preset、服务端登记快照、预算；作业幂等与归属校验 | 构建/smoke 结论与限长摘要 |
+
+统一管线：调用方与会话认证 → 配额 → 严格 Schema → 动作授权 → 外部操作 → 结果过滤 → 审计。关键写操作先持久记录意图；失败/超时需核对真实结果再重试。
+
+- 拒绝任意 Git URL、header、Broker shell、宿主路径和通用 HTTP 代理。
+- 首版 patch 仅允许普通 UTF-8 文件新增/修改/删除；拒绝 symlink、submodule、二进制、文件模式变更及未支持的 rename/copy。精确基线应用后复验最终树；不在 Broker 工作目录执行仓库 hook/filter。
+- `.github`、CODEOWNERS、发布与安全策略等控制文件仅允许文本建议，不自动应用。不能为修复 CI 放开控制路径。
+- 基线固定于会话；更新 PR 使用预期 head 防止覆盖并发提交。main 漂移时按策略要求重新核对/重建，不把每次等于瞬时 main HEAD 当作唯一策略。
+- GitHub App 安装仅 app 仓库，按需授予 Contents/PR 写、Actions 读；无规则 bypass。token 不天然限 `agent/` 分支，也不天然无 merge 能力，需结合 Broker 与真实分支更新规则验证。Broker 无 merge 工具，Agent 无 App 身份。
+- 禁止通过删除测试或放宽断言让 CI 假绿；受保护的独立验收测试不由 Agent 修改。
+
+## 六、验收边界
+
+- 在 shell、仓库安装脚本、Dockerfile RUN 和可执行 Skill 中分别尝试读取 canary 凭证/受禁文件和访问受禁网络；不能只测试模型是否拒绝。
+- 检查模型上下文、工具参数/结果、沙箱环境、工作区、Trace、日志和镜像层；受信进程的合法凭证使用与不可信区泄露分别验收。
+- 测试跨会话资源访问、伪造实例 ID、错误服务身份、过期/撤销 token 和重复调用。
+- 隔离测试须有允许目标的正向控制组；拒绝和超时原因可解释。有限负例通过不证明不存在所有逃逸或外传路径。
+- 平台故障影响 Agent 任务、自修与诊断；独立发布、已接受事务的本地恢复和人类告警不得等待 AgentKit。

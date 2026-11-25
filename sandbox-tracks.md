@@ -1,93 +1,102 @@
-# 沙箱与运行时：平台方案与自建方案（平行双轨）
+# 执行底座：SandboxProvider 与 BuildExecutor 分离
 
-两套方案并行交付：**Track-A 使用金山云星源 AgentKit 平台能力**（KSADK/AgentEngine 运行时、KCI 沙箱、MCP、Skills），**Track-B 全自建**（本地沙箱容器 + 构建执行器 + Broker 直连）。两轨共用同一套上层组件（Broker、发布协议、Deployer、审计），差异只收在**沙箱与执行底座**一层，通过 plugin 抽象层隔离。
+> 当前决策：拓扑 B；Agent 主循环在受信运行时，shell 与仓库代码在独立沙箱，真实镜像构建由独立 BuildExecutor 承担。首版交付一个通过门禁的组合，第二后端后置；不是双轨同时交付或等强度隔离承诺。凭证与身份见 [agent-runtime.md](agent-runtime.md)。
 
-## 一、Sandbox Provider 抽象层（plugin 架构）
+## 一、两类接口，不把构建能力强塞进沙箱
 
-所有沙箱能力收敛为一个抽象接口（生命周期、命令执行、文件交换、网络策略），Broker / 构建调度器只依赖接口，不感知后端，也不绑定具体实现语言：
-
-```
-SandboxProvider 接口（语言无关的契约描述）
-
-  Name() -> "agentkit" | "local"
-
-  /* 生命周期 */
-  Create(Spec) -> Instance
-    // Spec: 镜像/模板ID、专用 UID、workspace 卷、资源上限、超时、
-    //       网络策略（见 NetworkPolicy）、挂载白名单
-  Destroy(Instance)
-    // 任务结束即销毁
-
-Instance 接口
-  Exec(Cmd) -> ExecResult
-    // 沙箱内执行命令（shell 工具后端）
-    // ExecResult: 退出码 + stdout/stderr 截断 + 耗时
-  ReadFile / WriteFile(path, ...)
-    // workspace 内文件交换（patch 生成用）
-  NetPolicy() -> NetworkPolicy
-    // 实际生效策略自报，供验收核对
-
-NetworkPolicy
-  AllowEgress: [broker、构建执行器、受控包源]
-  DenyMeta: 云元数据/loopback 代理/DNS 重绑定防护
-  DNSStrategy: "stub-resolver"
+```text
+受信工具适配器 ── shell / 文件操作 ──> SandboxProvider
+        │                              └─ 独立 workspace 沙箱
+        └─ 冻结并登记内容快照 ───────────────┘
+        │
+        └─ broker_call(sandbox.build) → Broker → BuildExecutor
+                                                   └─ 独立临时构建环境
 ```
 
-两个实现均为独立 plugin，按需选择接入方式，不引入运行时动态加载：
+SandboxProvider 管理编辑、命令和文件工作区；BuildExecutor 管理构建作业。两者可以使用同一云厂商，但不共享可写 workspace、凭证或跨任务可写缓存。构建消费不可变快照，不读取一个仍被 shell 修改的目录。
 
+### SandboxProvider 契约
+
+```text
+Create(SandboxSpec) -> Instance
+Destroy(Instance) -> CleanupResult
+Instance.Exec(Cmd, Budget) -> ExecResult
+Instance.ReadFile / WriteFile(workspace_relative_path, ...)
+Instance.ExportSnapshot() -> SnapshotRef
+Instance.ObservePolicy() -> PolicyObservation
+
+SandboxSpec: 模板、专用 UID、允许挂载、网络模式、CPU/内存/PID/磁盘配额、TTL
+SnapshotRef: 内容摘要、归属 session、字节数、文件清单、不可变存储引用
 ```
-sandbox/
-  provider           # 抽象接口 + Spec/NetworkPolicy 定义 + plugin 注册
-  local/             # Track-B：本地容器后端
-  agentkit/          # Track-A：KCI 沙箱后端
-  contract/          # Provider 契约测试：任何后端必须通过的
-                     # 能力与隔离测试（SEC07、网络 DENY、超时、销毁）
+
+ExportSnapshot 必须冻结写入或用一致性快照机制；归档拒绝逃逸路径、特殊设备、symlink/gitlink、解压炸弹。快照存储与句柄由受信协调端登记，模型不能提供下载 URL 或宿主路径。ObservePolicy 是配置/观测信息，不是安全通过证明。
+
+### BuildExecutor 契约
+
+```text
+Submit(BuildSpec) -> JobID
+Status(JobID) -> JobState
+Result(JobID) -> BuildResult
+Cancel(JobID)
+Reconcile() -> OrphanCleanupResults
+
+BuildSpec: session、snapshot_id、固定 preset、幂等键、资源预算、deadline
+BuildResult: 退出状态、构建/业务 smoke 结果、限长脱敏日志、产物摘要、回收状态
 ```
 
-**关键设计：契约测试套件（contract tests）与后端无关。** SEC07（读宿主 .ssh/环境变量/Docker socket/云元数据全部拒绝）、网络 DENY、资源上限、销毁后零残留——这些用例直接针对 `Provider` 接口编写，Track-A 和 Track-B 跑同一套。这既是安全验收，也是"平台能力是否达到我们隔离标准"的实测答案（契约测试跑不过就说明 KCI 粒度不够，直接用证据说话）。
+只有 Broker/受信调度方可以提交和管理作业。模型仍只看到四个 Broker 动作，不新增任意远程执行 API。BuildExecutor 控制端若持有 VM/沙箱管理身份，该身份不能进入 guest。guest 不持有模型、平台、Broker、GitHub 或生产凭据，不接触生产网和宿主 Docker socket。
 
-### 两后端的差异点（诚实标注）
+沙箱构建产物只供反馈，不直接成为生产候选；正式候选由受保护 main CI 针对获批 source_sha 重新构建，并绑定 digest。
 
-| 维度 | local（自建） | agentkit（KCI） |
+## 二、可选后端组合与首版选择
+
+| 工具沙箱 | 构建执行器 | 决策条件 |
 | --- | --- | --- |
-| 隔离实现 | 本机容器 + 专用 UID + nftables 规则，我们完全掌控粒度 | 平台托管（E2B SDK），粒度依赖 KCI 模板配置；VPC 内资源访问可控 |
-| 元数据/DNS 防护 | 自配 stub resolver + 显式 DENY | 需实测模板网络选项是否覆盖；契约测试裁决 |
-| 构建环境 | 自维护构建镜像（docker/compose/多语言工具链） | KCI"实例提交为镜像"能力，模板预热池加速冷启动 |
-| 弹性 | 单机上限 | 平台弹性，多任务并发友好 |
-| 部署依赖 | 仅需一台受信主机 | 依赖金山云账号与平台可用性 |
+| KCI | KCI 上独立临时构建实例 | 真实构建、权限、网络、资源与清理测试全部达标后可用 |
+| KCI | 专用节点上的临时 VM | KCI 能满足工具沙箱隔离但不满足构建条件时，优先回退组合 |
+| local 一次性容器/VM | 专用临时构建环境 | 平台沙箱不达标时的备选；仍需独立验证 |
 
-## 二、Track-A：平台方案（AgentKit）
+D1–3 验证 KCI 工具沙箱和真实构建；依据证据选择一个合格组合。无法验证的能力标记“未验证”；不因首版预算不足而使用 privileged、宿主 Docker socket 或无限制网络凑结果。云端运行时若是比赛硬性要求，沙箱后端回退不等于放弃 AgentKit 运行时接入。
 
-**组件替换清单：**
+local 后端不是“天然安全的基准”：共享内核容器与 VM 的隔离假设不同。构建节点与生产主机必须分开；rootless 降低权限，不自动保证网络、进程和缓存隔离。BuildKit 的 user namespace、mount、snapshotter、PID namespace、seccomp/AppArmor 需求须在目标系统验证，不为构建随意关闭宿主防护。
 
-| 自建组件 | 平台替代 | 接入点 |
+Provider 的替换只覆盖其接口，不自动替换 AgentEngine、模型、MCP、Skills、会话存储和 GitHub。后端预置完成且能力满足时可通过配置切换；完整离线系统还需独立替换代码托管、registry、模型、依赖源与授权验证协议，不属于 MVP。
+
+## 三、网络与资源策略
+
+### 工具沙箱
+
+默认禁止外联；不直连 Broker、模型、平台管理 API、GitHub 或生产网络。源码/结果由受信控制端通过 Provider API 交换。平台控制通道所需端点单独审查，不向 guest 暴露管理凭据。必须使用沙箱实际配置验证，不能假设模板默认安全。
+
+### 构建环境
+
+MVP 优先使用受信预置依赖和基础镜像、离线构建；缺少缓存时报明确错误。如果示例必须在线下载，则显式选择“独立无秘密下载阶段 + 受控代理 + 后续离线构建”，不得自动回退任意外联。
+
+下载代理限定源、方法、路径与响应大小，覆盖解析后地址、重定向、IPv6、link-local、云元数据、内部网段和 DNS 重绑定。允许包源/DNS 不等于没有外传通道；还需评估可控包名/URL、DNS 隧道和依赖安装脚本。缓存按不可信任务和可信发布构建分域，记录依赖 lockfile、校验和与基础镜像 digest。
+
+CPU、内存、PID、磁盘/inode、输出量与时间均设上限。取消不仅停止等待，还需终止作业进程树并核对真实运行状态。守护端重启后回收孤儿任务。原始日志、镜像、卷和缓存按策略保留/清除；预热实例不得复用上一任务 workspace 或身份。
+
+## 四、验证体系：共享行为用例 + 后端专属证据
+
+共享测试面向契约，不要求两个后端已同时交付，也不把通过同一套有限测试解释为隔离强度等价。
+
+| 层级 | 必测内容 | 证据 |
 | --- | --- | --- |
-| Orchestrator 脚本 | KSADK（LangGraph）+ AgentEngine Serverless 运行时 | Agent 主循环用 LangGraph 写，`agentengine` CLI 部署 |
-| 沙箱 + 构建执行器 | KCI 沙箱（自定义模板） | `agentkit` Provider 实现，E2B SDK |
-| Broker 四动作 | Broker 不变 + **自定义 MCP Server** 包装（Streamable HTTP，代码方式部署） | 协议外壳，无新信任边界 |
-| DevOps 流程知识 | **Skills 中心**：containerize-node/spring/go、fix-ci-failure、security-review-app | 流程层，只调四动作，不扩工具面 |
-| Webhook 通知 | notifier（受信侧）→ AgentEngine 运行时 API 唤醒 Agent 会话 | 事件驱动替代轮询 ci.read |
+| 功能 | Exec、文件交换、快照一致性、真实 Dockerfile 构建、启动 HTTP smoke | 命令结果、快照摘要、镜像 digest、业务响应 |
+| 网络 | 允许目标正向控制；生产网、宿主、元数据、IPv6、重定向、DNS 重绑定拒绝 | guest 结果、受控接收端记录、有效策略配置 |
+| 文件/身份 | 宿主目录、socket、平台/模型/Broker/GitHub canary 不可读；跨会话快照拒绝 | 实际文件结果、认证拒绝与审计 |
+| 资源/生命周期 | 超时、后台进程、输出限额、资源上限、取消、重启回收 | cgroup/平台指标、作业及清理记录 |
+| 跨任务残留 | 新实例无法读取上一任务标记、无有效旧身份、无未授权缓存共享 | 两轮任务及撤销证据 |
+| 后端专属 | local 宿主策略核查；云端模板/API/供应商隔离说明与可观测限制 | 配置版本、平台返回、明确不可观测部分 |
 
-**原则**：MCP 给 Agent 手（能力，四动作白名单不变），Skills 给 Agent 脑（流程）；AgentKit 凭证按官方凭证分层放控制台密文变量，绝不进 Agent 会话上下文；Skill Runtime 需自建包含运行时的专用沙箱镜像（官方文档明确提醒通用 Sandbox ≠ Skill Runtime）。
+网络与文件负例分别在 shell、依赖脚本、Dockerfile RUN 和可执行 Skill 中测试。云租户不能直接证明物理宿主磁盘完全擦除；销毁验收限定为租户可观测的资源释放、身份撤销和跨任务不可达，不声称“物理零残留”。
 
-**Track-A 专属风险**：KCI 网络粒度以契约测试实测为准；平台可用性纳入故障分类（平台不可用 → 沙箱任务排队，不影响已运行生产——生产链路完全不经过 AgentKit）。
+## 五、首个 PoC 与止损
 
-## 三、Track-B：自建方案
+1. 固定平台模板/SDK/BuildKit/基础镜像版本与一个带真实依赖的 HTTP 应用。
+2. 在目标限制下构建并启动 smoke，保存实际权限与挂载配置。
+3. 同时执行隔离正负测试，不把整体断网误判成策略正确。
+4. 注入超时、后台进程、资源超限，验证取消和销毁。
+5. 创建下一任务检查残留；记录不可观测项与限制。
 
-全部跑在受信主机/自管虚拟机上：
-
-- Orchestrator：简单 Go 调度器（起容器、注册会话、TTL 回收），无外部依赖。
-- 沙箱：`local` Provider——一次性容器，专用 UID 2000，workspace 卷，nftables 白名单出口（仅 Broker、构建执行器、包源 proxy），stub resolver 防 DNS 重绑定，DENY 169.254.169.254。
-- 构建执行器：独立 rootless BuildKit 实例，固定参数、超时、资源上限。
-- Broker 直连（REST，原生协议），无 MCP 层——接口语义与 Track-A 的 MCP 工具一一对应。
-- Webhook：同一个 notifier，唤醒本地 Agent 进程（systemd socket 或本地队列轮询）。
-
-## 四、与上层架构的关系（两轨不变的部分）
-
-Broker 策略管线、proposal 校验、哈希链审计、获批 manifest 发布协议、Deployer、Environment 人工审批——**全部与沙箱后端无关**，因为 Provider 抽象保证了两轨对上层呈现完全一致的能力与隔离语义。演示叙事也顺：跑 Track-B 证明"不依赖任何云平台也成立"，切一个环境变量换 Track-A 证明"平台化接入零改造"。
-
-## 五、排期影响（23 天）
-
-- D 线（沙箱/Broker）改造：D3–5 先交付 `local` Provider + 契约测试（它是基准实现）；D9–11 并行加 `agentkit` Provider（E2B SDK + 模板镜像），跑同一契约测试。
-- 契约测试在 D3 冻结，作为两轨共同验收门禁。
-- MCP 包装层与 Skills 属 Track-A 增量，排 D12–15（与 Broker 收尾并行），不影响 Track-B 关键路径。
+通过后再实现 Provider 兼容和性能优化。KCI 不能安全构建时拆分 BuildExecutor；KCI 工具沙箱隔离本身不达标时换工具沙箱后端。无合格后端则暂停不可信执行，不能仅标“风险接受”后继续声称安全成立。
